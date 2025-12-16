@@ -122,6 +122,35 @@ function extractIssueKey(url) {
   return match ? match[1] : null;
 }
 
+// Helper function to normalize Jira URL by removing query parameters
+// This helps with cache lookups when the same issue is accessed via different routes
+function normalizeJiraUrl(url) {
+  if (!url) return url;
+  
+  // Extract the issue key
+  const issueKey = extractIssueKey(url);
+  if (!issueKey) return url;
+  
+  // For Jira URLs, construct a clean URL without query params
+  if (url.includes('/browse/') || url.includes('/issues/')) {
+    try {
+      const urlObj = new URL(url);
+      const baseUrl = `${urlObj.protocol}//${urlObj.hostname}`;
+      // Determine which path format is used
+      if (url.includes('/browse/')) {
+        return `${baseUrl}/browse/${issueKey}`;
+      } else if (url.includes('/issues/')) {
+        return `${baseUrl}/issues/${issueKey}`;
+      }
+    } catch (e) {
+      // If URL parsing fails, return original
+      return url;
+    }
+  }
+  
+  return url;
+}
+
 // Function to transform text with Jira URLs
 function transformJiraUrls(text) {
   if (!text || typeof text !== 'string') return text;
@@ -970,16 +999,23 @@ function handlePasteEvent(event) {
         }
       };
       
-      // Check if we already have the title cached
-      if (titleCache[sanitizedPastedText] && titleCache[sanitizedPastedText].title) {
+      // Normalize URL for cache lookup (removes query params like ?search_id=...)
+      const normalizedUrl = normalizeJiraUrl(sanitizedPastedText);
+      
+      // Check if we already have the title cached (try both original and normalized URL)
+      const cachedData = titleCache[sanitizedPastedText] || titleCache[normalizedUrl];
+      if (cachedData && cachedData.title) {
         // Use cached title - create HYPERLINK formula (no emoji, no issue key for Sheets)
-        const cachedData = titleCache[sanitizedPastedText];
         // Extract just the title part (remove issue key if present)
         let title = cachedData.title;
         // Remove issue key prefix if present (e.g., "PROJ-123: Title" -> "Title")
         const titleMatch = title.match(/^[A-Z]+-\d+:\s*(.+)$/i);
         if (titleMatch) {
           title = titleMatch[1];
+        }
+        // If title is just "Jira Issue" (fallback), use the issue key instead
+        if (title === 'Jira Issue' || title === 'Jira issue') {
+          title = issueKey;
         }
         // Escape double quotes in title for Google Sheets formula
         title = title.replace(/"/g, '""');
@@ -1000,17 +1036,25 @@ function handlePasteEvent(event) {
           if (response && response.title) {
             debugLog(`[${eventId}] Received Jira title from background: ${response.title}`);
             
-            // Cache the title
-            titleCache[sanitizedPastedText] = {
+            // Cache the title under both original and normalized URL for better cache hits
+            const cacheData = {
               title: response.title,
               issueType: response.issueType || "Unknown"
             };
+            titleCache[sanitizedPastedText] = cacheData;
+            if (normalizedUrl !== sanitizedPastedText) {
+              titleCache[normalizedUrl] = cacheData;
+            }
             
             // Extract just the title part (remove issue key if present)
             let title = response.title;
             const titleMatch = title.match(/^[A-Z]+-\d+:\s*(.+)$/i);
             if (titleMatch) {
               title = titleMatch[1];
+            }
+            // If title is just "Jira Issue" (fallback), use the issue key instead
+            if (title === 'Jira Issue' || title === 'Jira issue') {
+              title = issueKey;
             }
             // Escape double quotes in title for Google Sheets formula
             title = title.replace(/"/g, '""');
@@ -1099,11 +1143,15 @@ function handlePasteEvent(event) {
       // Generate a temporary text to use while we fetch the title
       const tempText = `${issueKey}: Loading...`;
       
-      // Check if we already have the title cached
-      if (titleCache[sanitizedPastedText]) {
+      // Normalize URL for cache lookup (removes query params like ?search_id=...)
+      const normalizedUrl = normalizeJiraUrl(sanitizedPastedText);
+      
+      // Check if we already have the title cached (try both original and normalized URL)
+      const cachedData = titleCache[sanitizedPastedText] || titleCache[normalizedUrl];
+      if (cachedData) {
         // Use cached title - but ensure it's properly formatted 
-        const cleanedTitle = cleanDisplayText(titleCache[sanitizedPastedText].title, sanitizedPastedText, platform);
-        const issueType = titleCache[sanitizedPastedText].issueType || "Unknown";
+        const cleanedTitle = cleanDisplayText(cachedData.title, sanitizedPastedText, platform);
+        const issueType = cachedData.issueType || "Unknown";
         debugLog(`[${eventId}] Using cached title: ${cleanedTitle}`);
         debugLog(`[${eventId}] Using cached issue type: ${issueType}`);
         
@@ -1174,11 +1222,15 @@ function handlePasteEvent(event) {
             debugLog(`[${eventId}] Received title from background: ${response.title}`);
             debugLog(`[${eventId}] Issue type: ${response.issueType}`);
             
-            // Cache the title and issue type
-            titleCache[sanitizedPastedText] = {
+            // Cache the title and issue type under both original and normalized URL
+            const cacheData = {
               title: response.title,
               issueType: response.issueType
             };
+            titleCache[sanitizedPastedText] = cacheData;
+            if (normalizedUrl !== sanitizedPastedText) {
+              titleCache[normalizedUrl] = cacheData;
+            }
             
             // Ensure the title is clean with no URL or duplicate issue keys
             const cleanedTitle = cleanDisplayText(response.title, sanitizedPastedText, platform);

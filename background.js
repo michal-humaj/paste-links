@@ -144,6 +144,35 @@ function extractIssueKeyFromUrl(url) {
   return simpleMatch ? simpleMatch[1] : null;
 }
 
+// Helper function to normalize Jira URL by removing query parameters
+// This helps with cache lookups when the same issue is accessed via different routes
+function normalizeJiraUrl(url) {
+  if (!url) return url;
+  
+  // Extract the issue key
+  const issueKey = extractIssueKeyFromUrl(url);
+  if (!issueKey) return url;
+  
+  // For Jira URLs, construct a clean URL without query params
+  if (url.includes('/browse/') || url.includes('/issues/')) {
+    try {
+      const urlObj = new URL(url);
+      const baseUrl = `${urlObj.protocol}//${urlObj.hostname}`;
+      // Determine which path format is used
+      if (url.includes('/browse/')) {
+        return `${baseUrl}/browse/${issueKey}`;
+      } else if (url.includes('/issues/')) {
+        return `${baseUrl}/issues/${issueKey}`;
+      }
+    } catch (e) {
+      // If URL parsing fails, return original
+      return url;
+    }
+  }
+  
+  return url;
+}
+
 // Clean the title to ensure it doesn't contain the URL
 function cleanTitle(title, url, issueKey) {
   if (!title) return null;
@@ -899,29 +928,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const url = request.url ? request.url.replace(/\r?\n/g, '') : request.url;
     const forceRefresh = request.forceRefresh || FORCE_REFRESH;
     
+    // Normalize URL for cache lookup (removes query params like ?search_id=...)
+    const normalizedUrl = normalizeJiraUrl(url);
+    
     // Detect and clear incorrect "Issue navigator" titles from cache
-    if (titleCache[url] && 
-        titleCache[url].title && 
-        titleCache[url].title.includes("Issue navigator")) {
+    const cachedEntry = titleCache[url] || titleCache[normalizedUrl];
+    if (cachedEntry && 
+        cachedEntry.title && 
+        cachedEntry.title.includes("Issue navigator")) {
       
       debugLog(`Found cached "Issue navigator" title for ${url} - clearing to force refresh`);
       delete titleCache[url];
+      if (normalizedUrl !== url) {
+        delete titleCache[normalizedUrl];
+      }
     }
     
     // Check if we have a cached title and we're not forcing a refresh
-    if (titleCache[url] && !forceRefresh) {
+    const cachedData = titleCache[url] || titleCache[normalizedUrl];
+    if (cachedData && !forceRefresh) {
       console.log('Using cached title for:', url);
-      debugLog(`Cached issue type: ${titleCache[url].issueType}`);
+      debugLog(`Cached issue type: ${cachedData.issueType}`);
       
       // Extract the issue key from the URL for cleaning
       const issueKey = extractIssueKeyFromUrl(url);
       
       // Clean the cached title just to be sure
-      const cleanedTitle = cleanTitle(titleCache[url].title, url, issueKey);
+      const cleanedTitle = cleanTitle(cachedData.title, url, issueKey);
       
       sendResponse({ 
         title: cleanedTitle, 
-        issueType: titleCache[url].issueType 
+        issueType: cachedData.issueType 
       });
       return true; // Keep the messaging channel open for async response
     }
@@ -940,11 +977,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           console.log('Got title from API:', apiResult.title);
           debugLog(`Got issue type from API: ${apiResult.issueType}`);
           
-          // Cache both title and issue type
-          titleCache[url] = {
+          // Cache both title and issue type under both original and normalized URL
+          const cacheData = {
             title: apiResult.title,
             issueType: apiResult.issueType
           };
+          titleCache[url] = cacheData;
+          if (normalizedUrl !== url) {
+            titleCache[normalizedUrl] = cacheData;
+          }
           
           sendResponse({ 
             title: apiResult.title, 
@@ -960,11 +1001,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           console.log('Got title from HTML:', htmlResult.title);
           debugLog(`Got issue type from HTML: ${htmlResult.issueType}`);
           
-          // Cache both title and issue type
-          titleCache[url] = {
+          // Cache both title and issue type under both original and normalized URL
+          const cacheData = {
             title: htmlResult.title,
             issueType: htmlResult.issueType
           };
+          titleCache[url] = cacheData;
+          if (normalizedUrl !== url) {
+            titleCache[normalizedUrl] = cacheData;
+          }
           
           sendResponse({ 
             title: htmlResult.title, 
@@ -977,11 +1022,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           
           console.log('Using fallback title:', fallbackTitle);
           
-          // Cache the fallback information
-          titleCache[url] = {
+          // Cache the fallback information under both original and normalized URL
+          const cacheData = {
             title: fallbackTitle,
             issueType: "Unknown"
           };
+          titleCache[url] = cacheData;
+          if (normalizedUrl !== url) {
+            titleCache[normalizedUrl] = cacheData;
+          }
           
           sendResponse({ 
             title: fallbackTitle, 
