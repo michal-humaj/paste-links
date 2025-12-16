@@ -6,12 +6,12 @@ const ISSUE_KEY_REGEX = /([A-Z]+-[0-9]+)/i;
 const ASANA_URL_REGEX = /https?:\/\/app\.asana\.com\/(?:\d+\/[\d\/]+|[\d\/]+\/(?:project|task)\/[\d\/]+)(?:\/f)?(?:[?#&].*|\s|$)/i;
 const ASANA_TASK_ID_REGEX = /(?:\/|task\/)(\d+)(?:\/f|[?#&].*|\s|$)/i;
 
-const DEBUG = true;
+const DEBUG = false;
 const FORCE_REFRESH = false;
 
 // Track whether the script has been initialized
 if (window._jiraLinkExtensionInitializedAt) {
-  console.warn(`DUPLICATE INITIALIZATION DETECTED! First initialized at: ${window._jiraLinkExtensionInitializedAt}, current time: ${Date.now()}`);
+  // Duplicate initialization detected - skip silently
 }
 
 // Function for logging debug messages - no-op when debug is disabled
@@ -21,8 +21,8 @@ function debugLog(message) {
   }
 }
 
-// IMMEDIATE STARTUP LOGGING - to confirm script is loading
-console.log(`CONTENT SCRIPT STARTED - Jira Link Beautifier ${Date.now()} - URL: ${window.location.href}`);
+// Script initialization timestamp
+// console.log(`CONTENT SCRIPT STARTED - Jira Link Beautifier ${Date.now()} - URL: ${window.location.href}`);
 
 // Add a visible indicator that the extension is working
 function addVisibleIndicator() {
@@ -76,6 +76,7 @@ let mutationObserver = null;
 // Global tracker for paste events to absolutely prevent duplicates
 window._jiraLinkLastPasteEventTime = 0;
 window._jiraLinkEventDedupeWindow = 100; // ms
+window._allowNextPaste = false; // Flag to allow paste events triggered by our execCommand
 
 // Helper function to check if we're on Google Chat
 function isGoogleChat() {
@@ -89,10 +90,17 @@ function isAsana() {
   return url.includes('app.asana.com');
 }
 
+// Helper function to check if we're on Google Sheets
+function isGoogleSheets() {
+  const url = window.location.href;
+  return url.includes('docs.google.com/spreadsheets');
+}
+
 // Helper function to determine the current platform
 function getCurrentPlatform() {
   if (isGoogleChat()) return 'google-chat';
   if (isAsana()) return 'asana';
+  if (isGoogleSheets()) return 'google-sheets';
   return 'unknown';
 }
 
@@ -434,6 +442,11 @@ function getTextNodesIn(node) {
 
 // Function to handle paste events
 function handlePasteEvent(event) {
+  // Skip if this is our own synthetic paste event (to prevent infinite loops)
+  if (event._isOurEvent) {
+    return;
+  }
+  
   // Check if we're on a supported platform before doing anything
   const platform = getCurrentPlatform();
   if (platform === 'unknown') {
@@ -489,8 +502,14 @@ function handlePasteEvent(event) {
   const eventId = Date.now() + Math.random().toString(36).substring(2, 8);
   
   // SUPER AGGRESSIVE DEDUPE: Check if we've processed any paste event in the last 100ms
+  // BUT allow through if we set the flag (for execCommand-triggered pastes)
   const now = Date.now();
   if (now - window._jiraLinkLastPasteEventTime < window._jiraLinkEventDedupeWindow) {
+    if (window._allowNextPaste) {
+      debugLog(`[${eventId}] Allowing paste event through (triggered by our execCommand)`);
+      window._allowNextPaste = false;
+      return; // Let it through without processing (native paste will happen)
+    }
     debugLog(`[${eventId}] BLOCKING: Another paste event was processed in the last ${window._jiraLinkEventDedupeWindow}ms`);
     event.preventDefault();
     event.stopPropagation();
@@ -744,7 +763,275 @@ function handlePasteEvent(event) {
       return; // We've handled the Asana URL, no need to check for Jira URLs
     }
     
-    // Continue with Jira URL handling (unchanged)
+    // Handle Asana links when pasting into Google Sheets
+    if (isSingleAsanaLink && platform === 'google-sheets') {
+      debugLog(`[${eventId}] Intercepted paste of Asana URL in Google Sheets: ${sanitizedPastedText}`);
+      
+      // Extract the task ID from the URL (same logic as Google Chat)
+      let taskId = null;
+      try {
+        // Priority 1: Check for /item/ format (specific to inbox/search views)
+        const itemMatch = sanitizedPastedText.match(/\/item\/(\d+)/);
+        if (itemMatch) {
+          taskId = itemMatch[1];
+          debugLog(`Extracted Asana task ID from /item/ segment: ${taskId}`);
+        }
+
+        // Priority 2: Check for /task/ format
+        if (!taskId) {
+          const taskMatch = sanitizedPastedText.match(/\/task\/(\d+)/);
+          if (taskMatch) {
+            taskId = taskMatch[1];
+            debugLog(`Extracted Asana task ID from /task/ segment: ${taskId}`);
+          }
+        }
+
+        // Priority 3: Standard regex
+        if (!taskId) {
+          const taskIdMatch = sanitizedPastedText.match(ASANA_TASK_ID_REGEX);
+          taskId = taskIdMatch ? taskIdMatch[1] : null;
+          if (taskId) debugLog(`Extracted Asana task ID via regex: ${taskId}`);
+        }
+        
+        // Priority 4: Fallback - largest numeric segment
+        if (!taskId) {
+          const urlParts = sanitizedPastedText.split('/');
+          let maxDigits = 0;
+          for (const part of urlParts) {
+            if (/^\d+$/.test(part) && part.length > maxDigits) {
+              taskId = part;
+              maxDigits = part.length;
+            }
+          }
+          if (taskId) {
+            debugLog(`Extracted Asana task ID from largest numeric segment: ${taskId}`);
+          }
+        }
+      } catch (error) {
+        debugLog(`Error extracting Asana task ID: ${error.message}`);
+      }
+      
+      if (!taskId) {
+        debugLog(`[${eventId}] Failed to extract task ID from Asana URL, falling back to default paste`);
+        return;
+      }
+      
+      // Prevent default paste immediately
+      event.preventDefault();
+      event.stopPropagation();
+      
+      // Record this paste to prevent duplicates
+      window._lastPastedText = sanitizedPastedText;
+      window._lastPasteTime = Date.now();
+      
+      // Store the original URL to restore clipboard later
+      const originalUrl = sanitizedPastedText;
+      
+      // Function to paste text into Google Sheets
+      const pasteIntoSheets = (text) => {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => {
+            debugLog(`[${eventId}] Wrote to clipboard: "${text.substring(0, 50)}..."`);
+            
+            // Focus the active element and trigger paste command
+            const activeEl = document.activeElement;
+            activeEl.focus();
+            
+            // Set flag to allow the next paste event through (triggered by execCommand)
+            window._allowNextPaste = true;
+            
+            // Use execCommand paste which will read from system clipboard
+            const success = document.execCommand('paste');
+            debugLog(`[${eventId}] execCommand paste result: ${success}`);
+            
+            if (!success) {
+              window._allowNextPaste = false;
+              // Try direct insertion as fallback
+              insertTextIntoGoogleSheets(activeEl, text);
+            }
+            
+            // Restore original URL to clipboard so user can paste it elsewhere if needed
+            setTimeout(() => {
+              navigator.clipboard.writeText(originalUrl).catch(() => {});
+            }, 200);
+          }).catch(err => {
+            debugLog(`[${eventId}] Clipboard write failed: ${err.message}`);
+            insertTextIntoGoogleSheets(document.activeElement, text);
+          });
+        } else {
+          insertTextIntoGoogleSheets(document.activeElement, text);
+        }
+      };
+      
+      // Check if we already have the title cached
+      if (titleCache[sanitizedPastedText] && titleCache[sanitizedPastedText].title && 
+          !titleCache[sanitizedPastedText].title.toLowerCase().includes('redirect')) {
+        // Use cached title - create HYPERLINK formula (no emoji for Sheets)
+        // Escape double quotes in title for Google Sheets formula
+        const title = titleCache[sanitizedPastedText].title.replace(/"/g, '""');
+        const textToPaste = `=HYPERLINK("${sanitizedPastedText}", "${title}")`;
+        debugLog(`[${eventId}] Using cached Asana title for Sheets: ${title}`);
+        pasteIntoSheets(textToPaste);
+      } else {
+        // No cached title - fetch it first, THEN paste
+        debugLog(`[${eventId}] Fetching Asana title before pasting...`);
+        
+        chrome.runtime.sendMessage({
+          action: 'fetchAsanaTitle',
+          url: sanitizedPastedText,
+          taskId: taskId,
+          forceRefresh: FORCE_REFRESH
+        }, response => {
+          let textToPaste;
+          
+          if (response && response.title && 
+              !response.title.toLowerCase().includes('redirect')) {
+            debugLog(`[${eventId}] Received Asana title from background: ${response.title}`);
+            
+            // Cache the title
+            titleCache[sanitizedPastedText] = {
+              title: response.title,
+              issueType: "AsanaTask"
+            };
+            
+            // Escape double quotes in title for Google Sheets formula
+            const escapedTitle = response.title.replace(/"/g, '""');
+            // Create HYPERLINK formula with actual title (no emoji for Sheets)
+            textToPaste = `=HYPERLINK("${sanitizedPastedText}", "${escapedTitle}")`;
+          } else {
+            debugLog(`[${eventId}] Failed to get Asana title, using fallback`);
+            // Fallback to just the task ID (no emoji for Sheets)
+            textToPaste = `=HYPERLINK("${sanitizedPastedText}", "Asana Task ${taskId}")`;
+          }
+          
+          // Now paste the text
+          pasteIntoSheets(textToPaste);
+        });
+      }
+      
+      return; // We've handled the Asana URL in Google Sheets
+    }
+    
+    // Handle Jira links when pasting into Google Sheets
+    if (isSingleJiraLink && platform === 'google-sheets') {
+      debugLog(`[${eventId}] Intercepted paste of Jira URL in Google Sheets: ${sanitizedPastedText}`);
+      
+      // Extract the issue key from the URL
+      const issueKey = extractIssueKey(sanitizedPastedText);
+      if (!issueKey) {
+        debugLog(`[${eventId}] Failed to extract issue key from Jira URL, falling back to default paste`);
+        return;
+      }
+      
+      // Prevent default paste immediately
+      event.preventDefault();
+      event.stopPropagation();
+      
+      // Record this paste to prevent duplicates
+      window._lastPastedText = sanitizedPastedText;
+      window._lastPasteTime = Date.now();
+      
+      // Store the original URL to restore clipboard later
+      const originalUrl = sanitizedPastedText;
+      
+      // Function to paste text into Google Sheets
+      const pasteJiraIntoSheets = (text) => {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => {
+            debugLog(`[${eventId}] Wrote Jira to clipboard: "${text.substring(0, 50)}..."`);
+            
+            // Focus the active element and trigger paste command
+            const activeEl = document.activeElement;
+            activeEl.focus();
+            
+            // Set flag to allow the next paste event through (triggered by execCommand)
+            window._allowNextPaste = true;
+            
+            // Use execCommand paste which will read from system clipboard
+            const success = document.execCommand('paste');
+            debugLog(`[${eventId}] execCommand paste result: ${success}`);
+            
+            if (!success) {
+              window._allowNextPaste = false;
+              // Try direct insertion as fallback
+              insertTextIntoGoogleSheets(activeEl, text);
+            }
+            
+            // Restore original URL to clipboard so user can paste it elsewhere if needed
+            setTimeout(() => {
+              navigator.clipboard.writeText(originalUrl).catch(() => {});
+            }, 200);
+          }).catch(err => {
+            debugLog(`[${eventId}] Clipboard write failed: ${err.message}`);
+            insertTextIntoGoogleSheets(document.activeElement, text);
+          });
+        } else {
+          insertTextIntoGoogleSheets(document.activeElement, text);
+        }
+      };
+      
+      // Check if we already have the title cached
+      if (titleCache[sanitizedPastedText] && titleCache[sanitizedPastedText].title) {
+        // Use cached title - create HYPERLINK formula (no emoji, no issue key for Sheets)
+        const cachedData = titleCache[sanitizedPastedText];
+        // Extract just the title part (remove issue key if present)
+        let title = cachedData.title;
+        // Remove issue key prefix if present (e.g., "PROJ-123: Title" -> "Title")
+        const titleMatch = title.match(/^[A-Z]+-\d+:\s*(.+)$/i);
+        if (titleMatch) {
+          title = titleMatch[1];
+        }
+        // Escape double quotes in title for Google Sheets formula
+        title = title.replace(/"/g, '""');
+        const textToPaste = `=HYPERLINK("${sanitizedPastedText}", "${title}")`;
+        debugLog(`[${eventId}] Using cached Jira title for Sheets: ${title}`);
+        pasteJiraIntoSheets(textToPaste);
+      } else {
+        // No cached title - fetch it first, THEN paste
+        debugLog(`[${eventId}] Fetching Jira title before pasting...`);
+        
+        chrome.runtime.sendMessage({
+          action: 'fetchJiraTitle',
+          url: sanitizedPastedText,
+          forceRefresh: FORCE_REFRESH
+        }, response => {
+          let textToPaste;
+          
+          if (response && response.title) {
+            debugLog(`[${eventId}] Received Jira title from background: ${response.title}`);
+            
+            // Cache the title
+            titleCache[sanitizedPastedText] = {
+              title: response.title,
+              issueType: response.issueType || "Unknown"
+            };
+            
+            // Extract just the title part (remove issue key if present)
+            let title = response.title;
+            const titleMatch = title.match(/^[A-Z]+-\d+:\s*(.+)$/i);
+            if (titleMatch) {
+              title = titleMatch[1];
+            }
+            // Escape double quotes in title for Google Sheets formula
+            title = title.replace(/"/g, '""');
+            
+            // Create HYPERLINK formula with just the title (no emoji, no issue key for Sheets)
+            textToPaste = `=HYPERLINK("${sanitizedPastedText}", "${title}")`;
+          } else {
+            debugLog(`[${eventId}] Failed to get Jira title, using fallback`);
+            // Fallback to issue key only
+            textToPaste = `=HYPERLINK("${sanitizedPastedText}", "${issueKey}")`;
+          }
+          
+          // Now paste the text
+          pasteJiraIntoSheets(textToPaste);
+        });
+      }
+      
+      return; // We've handled the Jira URL in Google Sheets
+    }
+    
+    // Continue with Jira URL handling (for other platforms)
     if (isJiraUrl || probablyJiraUrl) {
       debugLog(`[${eventId}] Intercepted paste of potential Jira URL: ${sanitizedPastedText}`);
       
@@ -933,7 +1220,106 @@ function handlePasteEvent(event) {
     }
   } catch (error) {
     // Log any errors but don't interrupt the user's experience
-    console.error(`[${eventId}] Jira Link Extension paste handler error:`, error);
+    // Error in paste handler - fail silently in production
+    if (DEBUG) console.error(`[${eventId}] Jira Link Extension paste handler error:`, error);
+  }
+}
+
+// Function to insert text into Google Sheets cell editor
+function insertTextIntoGoogleSheets(element, text) {
+  debugLog(`Inserting text into Google Sheets: "${text.substring(0, 50)}..."`);
+  
+  try {
+    // Log what element we're working with
+    const activeEl = document.activeElement;
+    debugLog(`Active element: ${activeEl.tagName}, class: ${activeEl.className}, contentEditable: ${activeEl.isContentEditable}`);
+    
+    // Google Sheets uses an iframe for text input - find it
+    const textEventIframe = document.querySelector('.docs-texteventtarget-iframe');
+    let targetDoc = document;
+    let targetElement = activeEl;
+    
+    if (textEventIframe && textEventIframe.contentDocument) {
+      targetDoc = textEventIframe.contentDocument;
+      targetElement = targetDoc.body || targetDoc.activeElement || textEventIframe;
+      debugLog(`Found Google Sheets text event iframe, targeting its body`);
+    }
+    
+    // Try to find the actual cell editor input
+    const cellInput = document.querySelector('.cell-input') || 
+                      document.querySelector('[data-sheets-value]') ||
+                      document.querySelector('.waffle-text-input');
+    if (cellInput) {
+      targetElement = cellInput;
+      debugLog(`Found cell input element: ${cellInput.tagName}, class: ${cellInput.className}`);
+    }
+    
+    // Method 1: Try execCommand on the target document
+    targetElement.focus();
+    const execResult = targetDoc.execCommand('insertText', false, text);
+    debugLog(`execCommand insertText result: ${execResult}`);
+    
+    if (execResult) {
+      // Dispatch input event to notify Google Sheets
+      targetElement.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: text
+      }));
+      return true;
+    }
+    
+    // Method 2: If execCommand failed, try character-by-character simulation
+    debugLog('execCommand failed, trying character simulation on iframe');
+    
+    // Focus the iframe content
+    if (textEventIframe && textEventIframe.contentDocument) {
+      const iframeBody = textEventIframe.contentDocument.body;
+      if (iframeBody) {
+        iframeBody.focus();
+        
+        // Type each character
+        for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+          const charCode = char.charCodeAt(0);
+          
+          // Dispatch to iframe document
+          ['keydown', 'keypress', 'keyup'].forEach(eventType => {
+            const event = new KeyboardEvent(eventType, {
+              key: char,
+              code: charCode >= 65 && charCode <= 90 ? `Key${char.toUpperCase()}` : undefined,
+              charCode: charCode,
+              keyCode: charCode,
+              which: charCode,
+              bubbles: true,
+              cancelable: true,
+              view: textEventIframe.contentWindow
+            });
+            iframeBody.dispatchEvent(event);
+          });
+          
+          // Also dispatch input event
+          const inputEvent = new InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: char,
+            view: textEventIframe.contentWindow
+          });
+          iframeBody.dispatchEvent(inputEvent);
+        }
+        
+        debugLog(`Simulated typing ${text.length} characters in iframe`);
+        return true;
+      }
+    }
+    
+    debugLog('All insertion methods failed');
+    return false;
+  } catch (error) {
+    debugLog(`Error inserting text into Google Sheets: ${error.message}`);
+    return false;
   }
 }
 
@@ -1542,7 +1928,7 @@ function replaceLastPastedJiraLink(element, oldText, url, newText, issueType = "
     debugLog(`Failed to find and update link for: ${url}`);
     return false;
   } catch (error) {
-    console.error(`Error replacing link: ${error.message}`);
+    debugLog(`Error replacing link: ${error.message}`);
     return false;
   }
 }

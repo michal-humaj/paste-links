@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Jira and Asana Link Beautifier",
-  "version": "1.3",
-  "description": "Beautifies Jira links in Google Chat and Asana, and Asana links in Google Chat, with proper titles and icons",
+  "version": "1.5",
+  "description": "Transform ugly Jira & Asana URLs into clean, clickable links with task titles in Google Chat, Asana, and Google Sheets.",
   "permissions": [
     "clipboardWrite",
     "clipboardRead",
@@ -13,14 +13,15 @@
     "https://*.atlassian.net/*",
     "https://chat.google.com/*",
     "https://mail.google.com/chat/*",
-    "https://app.asana.com/*"
+    "https://app.asana.com/*",
+    "https://docs.google.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://chat.google.com/*", "https://mail.google.com/chat/*", "https://app.asana.com/*"],
+      "matches": ["https://chat.google.com/*", "https://mail.google.com/chat/*", "https://app.asana.com/*", "https://docs.google.com/spreadsheets/*"],
       "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": true

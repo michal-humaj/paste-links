@@ -1,20 +1,18 @@
 // Cache for storing fetched Jira titles and issue types
 const titleCache = {}; // URL -> { title, issueType }
 
-// Debug flag - set to true for console logging
-const DEBUG = true;
+// Debug flag - set to false for production
+const DEBUG = false;
 
 // Force refresh of titles (for testing purposes)
-const FORCE_REFRESH = true;
+const FORCE_REFRESH = false;
 
-// IMMEDIATE STARTUP LOGGING - to confirm script is loading
-console.log("BACKGROUND SCRIPT STARTED - Jira Link Beautifier");
-// Try to log to both console methods to ensure visibility
-console.error("BACKGROUND SCRIPT STARTUP TEST - Jira Link Beautifier");
+// Background script startup
+// console.log("BACKGROUND SCRIPT STARTED - Jira Link Beautifier");
 
 // Clear the cache on startup if in debug mode
 if (DEBUG && FORCE_REFRESH) {
-  console.log("DEBUG MODE: Clearing title cache on startup");
+  // console.log("DEBUG MODE: Clearing title cache on startup");
   Object.keys(titleCache).forEach(key => {
     delete titleCache[key];
   });
