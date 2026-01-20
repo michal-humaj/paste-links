@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Jira and Asana Link Beautifier",
-  "version": "1.5",
+  "version": "1.6",
   "description": "Transform ugly Jira & Asana URLs into clean, clickable links with task titles in Google Chat, Asana, and Google Sheets.",
   "permissions": [
     "clipboardWrite",
